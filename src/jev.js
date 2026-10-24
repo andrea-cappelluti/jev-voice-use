@@ -5,8 +5,17 @@
  * API key stays server-side. Reads TYPESAFE_API_KEY, falling back to JEV_API_KEY.
  */
 import { TypeSafeClient, choice, noul, score, APIUserAbortError } from "@typesafe-ai/sdk";
-import { MODEL, PRICE_PER_M_INPUT_TOKENS_USD, QUESTIONS, MAX_TRANSCRIPT_CHARS, MAX_CONTEXT_ACTIONS } from "./constants.js";
-import { extractTextCandidates, extractUrlCandidates } from "./spans.js";
+import {
+  MODEL,
+  PRICE_PER_M_INPUT_TOKENS_USD,
+  QUESTIONS as BROWSER_QUESTIONS,
+  DESKTOP_QUESTIONS,
+  MAX_TRANSCRIPT_CHARS,
+  MAX_CONTEXT_ACTIONS,
+  TAB_WORDS_RE,
+} from "./constants.js";
+import { extractTextCandidates, extractUrlCandidates, wantsSubmit, wantsNewTab, parseRepeatCount, startsWithOpenVerb } from "./spans.js";
+import { parseMathExpression } from "./math.js";
 
 let _client = null;
 
@@ -54,6 +63,7 @@ export function encodeElement(el, pageHost = "") {
     if (host && host !== pageHost) s += ` → ${host}`;
   }
   if (el.below_fold) s += " [below fold]";
+  if (el.toolbar) s += " [browser toolbar]";
   return s;
 }
 
@@ -97,13 +107,25 @@ export function buildRequest({ transcript, snapshot, pendingConfirmation = null,
 
   const elements = snapshot?.elements || [];
   const pageHost = hostOf(snapshot?.url);
+  // Desktop mode (snapshot from desktop.js): the "page" is the frontmost application's window.
+  const desktop = Boolean(snapshot?.desktop);
+  const QUESTIONS = desktop ? DESKTOP_QUESTIONS : BROWSER_QUESTIONS;
+  const onWeb = /^https?:/i.test(snapshot?.url || "");
   const state = {
-    transcript: text,
-    page: {
-      url: (snapshot?.url || "about:blank").slice(0, 200),
-      title: (snapshot?.title || "").slice(0, 120),
-      site: snapshot?.site || "blank",
-    },
+    // Jev reads a sentence-cased transcript more reliably than the bare lowercase "paste" / "mute" some
+    // recognizers emit for one-word commands; the candidate spans below still come from the raw text.
+    transcript: text.charAt(0).toUpperCase() + text.slice(1),
+    page: desktop
+      ? {
+          app: snapshot.app || "",
+          title: (snapshot.title || "").slice(0, 120),
+          ...(onWeb ? { url: snapshot.url.slice(0, 200), site: snapshot.site } : {}),
+        }
+      : {
+          url: (snapshot?.url || "about:blank").slice(0, 200),
+          title: (snapshot?.title || "").slice(0, 120),
+          site: snapshot?.site || "blank",
+        },
     // One compact line per element, in visual order (viewport first). The `target` question's
     // options are these ids; their text lives here (semantic-find pattern) to halve token use.
     elements: elements.map((el) => encodeElement(el, pageHost)),
@@ -125,8 +147,11 @@ export function buildRequest({ transcript, snapshot, pendingConfirmation = null,
     is_command: noul(QUESTIONS.is_command.instructions, QUESTIONS.is_command.criteria),
     destructive: noul(QUESTIONS.destructive.instructions, QUESTIONS.destructive.criteria),
     scroll_amount: score(QUESTIONS.scroll_amount.instructions, QUESTIONS.scroll_amount.criteria),
-    tab_direction: choice(QUESTIONS.tab_direction.instructions, QUESTIONS.tab_direction.criteria),
+    // Closed set of keys / standard commands (copy, escape, volume...): the keys themselves live in code.
+    control: choice(QUESTIONS.control.instructions, QUESTIONS.control.criteria),
   };
+  // Every question is tokens and tokens are latency: the tab question (11 options) is only asked when the words mention tabs.
+  if (TAB_WORDS_RE.test(text)) questions.tab_direction = choice(QUESTIONS.tab_direction.instructions, QUESTIONS.tab_direction.criteria);
   if (ctx?.recent_actions?.length) {
     questions.is_correction = noul(QUESTIONS.is_correction.instructions, QUESTIONS.is_correction.criteria);
   }
@@ -141,8 +166,30 @@ export function buildRequest({ transcript, snapshot, pendingConfirmation = null,
     c.none = "No web address is mentioned";
     questions.url_span = choice(QUESTIONS.url_span.instructions, c);
   }
+  if (desktop && snapshot.apps?.length) {
+    // The localized name ("Calcolatrice") is a hint on the English-named option, never a new option.
+    const c = Object.fromEntries(
+      snapshot.apps.map((name) => {
+        const alias = snapshot.appAliases?.[name];
+        const hints = [alias && alias !== name && `also called ${alias}`, name === snapshot.defaultBrowser && "the default web browser (il browser)"].filter(Boolean);
+        return [name, hints.length ? hints.join("; ") : null];
+      }),
+    );
+    c.none = "No application is named";
+    questions.app = choice(QUESTIONS.app.instructions, c);
+  }
 
-  return { state, questions, candidates: { text: textCandidates, url: urlCandidates } };
+  // Everything code extracts from the words; Jev only picks among these, the policy copies them.
+  const candidates = {
+    text: textCandidates,
+    url: urlCandidates,
+    math: parseMathExpression(text),
+    submit: wantsSubmit(text),
+    newTab: wantsNewTab(text),
+    repeat: parseRepeatCount(text),
+    openVerb: startsWithOpenVerb(text),
+  };
+  return { state, questions, candidates };
 }
 
 /**

@@ -77,7 +77,16 @@ const STEPS = [
   // Two commands in one breath: the first executes as soon as it is complete, the remaining
   // words become a new command.
   { say: "go to example dot com and click the more information link", expect: (b) => url(b).includes("iana.org"), multi: true },
+  // The same session in Italian: commands are bilingual, nothing to switch.
+  { say: "vai su wikipedia", expect: (b) => url(b).includes("wikipedia.org") },
+  { say: "cerca alan turing", expect: (b) => /Alan_Turing|search=alan/i.test(url(b)) },
+  { say: "scorri giù", expect: async (b) => (await scrollY(b)) > 50 },
+  { say: "indietro", expect: (b) => url(b).includes("wikipedia.org") && !/Alan_Turing/.test(url(b)) },
+  { say: "apri una nuova scheda", expect: (b) => b.pages.length === 2 },
+  { say: "chiudi la scheda", expect: (b) => b.pages.length === 1 },
+  { say: "premi tab", expect: (b) => b.page.evaluate(() => document.activeElement && document.activeElement !== document.body).catch(() => false) },
   { say: "so anyway I think we should get lunch", expectNoAction: true, expect: () => true },
+  { say: "allora secondo me dovremmo andare a pranzo", expectNoAction: true, expect: () => true },
 ];
 
 async function main() {

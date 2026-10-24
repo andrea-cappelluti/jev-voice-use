@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>ai.typesafe.voice-browser.helper</string>
+	<key>CFBundleName</key>
+	<string>voice-browser helper</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>voice-browser listens to your spoken commands while the microphone is switched on.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>voice-browser turns your spoken commands into text to decide what to do.</string>
+</dict>
+</plist>

@@ -107,3 +107,27 @@ test("policy: a plain follow-up command is not treated as a correction", () => {
   assert.ok(!p.reasons.some((r) => r.name === "is_correction"));
   assert.ok(T.correction > 0.05);
 });
+
+test("buildRequest: the control question is always asked, candidates carry the code-extracted fields", () => {
+  const { questions, candidates } = buildRequest({ transcript: "calcola 7 per 6", snapshot });
+  assert.ok(questions.control, "control question present");
+  assert.ok("copy" in questions.control.criteria || "key_enter" in questions.control.criteria);
+  assert.deepEqual(Object.keys(candidates).sort(), ["math", "newTab", "openVerb", "repeat", "submit", "text", "url"]);
+  assert.equal(candidates.math?.expr, "7*6");
+  assert.equal(candidates.submit, false);
+  assert.equal(buildRequest({ transcript: "scrivi ciao e invia", snapshot }).candidates.submit, true);
+  assert.equal(candidates.newTab, false);
+  assert.equal(candidates.repeat, 1);
+  const rep = buildRequest({ transcript: "premi giù tre volte", snapshot }).candidates;
+  assert.equal(rep.repeat, 3);
+  assert.equal(rep.math, null);
+});
+
+test("buildRequest: desktop app criteria carry the localized name as a hint, not as a new option", () => {
+  const desktop = { desktop: true, app: "Finder", title: "", url: "app://Finder/", site: "generic", elements: [], apps: ["Calculator", "Safari"], appAliases: { Calculator: "Calcolatrice" } };
+  const { questions } = buildRequest({ transcript: "apri la calcolatrice", snapshot: desktop });
+  assert.deepEqual(Object.keys(questions.app.criteria), ["Calculator", "Safari", "none"]);
+  assert.equal(questions.app.criteria.Calculator, "also called Calcolatrice");
+  assert.equal(questions.app.criteria.Safari, null);
+  assert.ok(questions.control.criteria.quit_app, "desktop control set is the full one");
+});

@@ -7,6 +7,22 @@ import { describe } from "./policy.js";
 
 const NAV_TIMEOUT = 15000;
 
+const KEY_NAMES = {
+  return: "Enter", enter: "Enter", escape: "Escape", tab: "Tab", space: "Space", delete: "Backspace", backspace: "Backspace",
+  forwarddelete: "Delete", left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown",
+  home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown",
+};
+const MOD_NAMES = { cmd: "ControlOrMeta", command: "ControlOrMeta", shift: "Shift", alt: "Alt", option: "Alt", opt: "Alt", ctrl: "Control", control: "Control" };
+
+/** Helper key name + modifiers -> Playwright's `keyboard.press` string ("ControlOrMeta+Shift+Tab"). */
+export function toPlaywrightKey(key, mods = []) {
+  const k = KEY_NAMES[String(key).toLowerCase()] ?? (String(key).length === 1 ? String(key) : key);
+  return [...mods.map((m) => MOD_NAMES[String(m).toLowerCase()] ?? m), k].join("+");
+}
+
+/** The only shortcuts that mean the same thing inside a page. */
+const PAGE_SHORTCUTS = new Set(["copy", "cut", "paste", "select_all", "undo", "redo"]);
+
 function locatorFor(page, id) {
   return page.locator(`[data-vb-id="${id}"]`).first();
 }
@@ -29,12 +45,17 @@ async function maybeNewTab(browser, before) {
  * @returns {Promise<{ok: boolean, detail?: string}>}
  */
 export async function execute(action, browser) {
-  const page = await browser.ensurePage();
-  const label = describe(action);
+  let page = await browser.ensurePage();
+  const label = describe(action, browser.uiLang || "en");
 
   switch (action.type) {
     case "navigate_url": {
       await browser.overlay("toast", `→ ${label}`);
+      if (action.newTab) {
+        // Only when the user asked for it ("in una nuova scheda"): otherwise the current tab navigates.
+        page = await browser.context.newPage();
+        await browser.setActive(page);
+      }
       const host = new URL(action.url).hostname.replace(/^www\./, "");
       try {
         await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
@@ -68,8 +89,17 @@ export async function execute(action, browser) {
 
     case "type_into_field": {
       await browser.overlay("clearCandidates");
-      await browser.overlay("highlight", action.targetId, HIGHLIGHT_MS + 400);
+      if (action.targetId) await browser.overlay("highlight", action.targetId, HIGHLIGHT_MS + 400);
       await browser.overlay("toast", label);
+      if (!action.targetId) {
+        // No field named: type wherever the keyboard focus is.
+        await page.keyboard.type(action.text, { delay: 18 });
+        if (action.submit) {
+          await page.keyboard.press("Enter");
+          await settle(page);
+        }
+        return { ok: true, detail: page.url() };
+      }
       const loc = locatorFor(page, action.targetId);
       await loc.click({ timeout: 4000 }).catch(() => loc.focus());
       await loc.fill("").catch(() => {});
@@ -103,6 +133,33 @@ export async function execute(action, browser) {
       await page.keyboard.press("Enter");
       await settle(page);
       return { ok: true, detail: page.url() };
+
+    case "press_key": {
+      await browser.overlay("toast", label);
+      const combo = toPlaywrightKey(action.key, action.mods);
+      for (let i = 0; i < Math.min(20, Math.max(1, action.count || 1)); i++) await page.keyboard.press(combo);
+      await page.waitForTimeout(120);
+      return { ok: true, detail: page.url() };
+    }
+
+    case "shortcut": {
+      if (!PAGE_SHORTCUTS.has(action.id)) return { ok: false, detail: "not available in the browser window" };
+      await browser.overlay("toast", label);
+      await page.keyboard.press(`ControlOrMeta+${action.shift ? "Shift+" : ""}${action.char}`);
+      return { ok: true, detail: page.url() };
+    }
+
+    case "calculate":
+      // The result is computed in code (math.js): showing it is the whole job in a browser window.
+      await browser.overlay("toast", action.label, 4000);
+      return { ok: true, detail: action.label };
+
+    case "window_op":
+    case "clear_field":
+    case "volume":
+    case "quit_app":
+    case "send_keys":
+      return { ok: false, detail: "desktop mode only" };
 
     case "scroll_down":
     case "scroll_up": {
@@ -160,8 +217,12 @@ export async function execute(action, browser) {
       if (pages.length < 2) return { ok: false, detail: "only one tab" };
       const i = pages.indexOf(browser.page);
       let next;
-      if (action.direction === "previous") next = pages[(i - 1 + pages.length) % pages.length];
-      else if (action.direction === "first") next = pages[0];
+      // `position` is Cmd+<n> semantics: 1..8 is that tab, 9 is always the last one.
+      const position = action.position ?? (action.direction === "first" ? 1 : null);
+      if (position) {
+        next = position === 9 ? pages[pages.length - 1] : pages[position - 1];
+        if (!next) return { ok: false, detail: `no tab ${position}` };
+      } else if (action.direction === "previous") next = pages[(i - 1 + pages.length) % pages.length];
       else next = pages[(i + 1) % pages.length];
       await browser.setActive(next);
       await browser.overlay("toast", "switched tab");

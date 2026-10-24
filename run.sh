@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Launch the voice-browser server with the API key exported server-side.
-# Usage: ./run.sh [--port 8787] [--host 127.0.0.1] [--headless] [--cdp ws://...] [--start-url https://...]
+# Usage: ./run.sh [--port 8787] [--host 127.0.0.1] [--lang en-US]                    (macOS: controls the whole Mac)
+#        ./run.sh --browser [--headless] [--cdp ws://...] [--start-url https://...]  (one Chromium window)
 #
 # The key is read from the TYPESAFE_API_KEY environment variable, or from a local .env file
 # (copy .env.example to .env). It is never sent to the control page in the browser.

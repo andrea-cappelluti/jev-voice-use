@@ -100,3 +100,77 @@ test("findSearchBox prefers role=searchbox / search-ish names", () => {
   assert.equal(findSearchBox(els), "e02");
   assert.equal(findSearchBox([raw(3)]), null);
 });
+
+// --- desktop / browser-window additions --------------------------------------------------------
+import { isBrowserApp } from "../../src/snapshot.js";
+
+test("findSearchBox: the browser omnibox is never the page search box (diagnosed Chrome in Italian)", () => {
+  const els = [
+    raw(1, { role: "textbox", tag: "input", text: "Barra degli indirizzi e di ricerca", placeholder: "", inputName: "", top: 80, inViewport: true, web: false }),
+    raw(2, { role: "combobox", tag: "input", text: "", placeholder: "Cerca", inputName: "", top: 150, inViewport: true, web: true }),
+  ];
+  assert.equal(findSearchBox(els), "e02");
+  assert.equal(findSearchBox(els, { webOnly: true }), "e02");
+  // even without any web flags the address bar is excluded
+  const noFlags = els.map(({ web, ...e }) => e);
+  assert.equal(findSearchBox(noFlags), "e02");
+  assert.equal(findSearchBox(noFlags.slice(0, 1)), null);
+});
+
+test("findSearchBox: webOnly ignores toolbar inputs, but a Finder-like searchbox is found without it", () => {
+  const toolbar = raw(1, { role: "searchbox", tag: "input", text: "Search", web: false, inViewport: true });
+  assert.equal(findSearchBox([toolbar], { webOnly: true }), null);
+  assert.equal(findSearchBox([toolbar], { webOnly: false }), "e01");
+  assert.equal(findSearchBox([toolbar]), "e01");
+});
+
+test("findSearchBox: bilingual detection", () => {
+  for (const placeholder of ["Cerca", "Cerca su Wikipedia", "Ricerca", "Trova", "Search", "Find", "Query"]) {
+    const els = [raw(1, { role: "textbox", tag: "input", text: "", placeholder, web: true })];
+    assert.equal(findSearchBox(els, { webOnly: true }), "e01", placeholder);
+  }
+  assert.equal(findSearchBox([raw(1, { role: "textbox", tag: "input", text: "", placeholder: "Nome", web: true })]), null);
+  assert.equal(findSearchBox([raw(1, { role: "textbox", tag: "input", text: "", placeholder: "Search or enter URL", web: false })]), null, "URL bar wording");
+});
+
+test("detectSite: new sites and Google properties", () => {
+  assert.equal(detectSite("https://www.google.it/search?q=x"), "google");
+  assert.equal(detectSite("https://www.google.com/maps/place/Roma"), "google_maps");
+  assert.equal(detectSite("https://maps.google.com/"), "google_maps");
+  assert.equal(detectSite("https://mail.google.com/mail/u/0/"), "gmail");
+  assert.equal(detectSite("https://www.amazon.it/s?k=x"), "amazon");
+  assert.equal(detectSite("https://it.wikipedia.org/wiki/Roma"), "wikipedia");
+  assert.equal(detectSite("https://www.linkedin.com/feed/"), "linkedin");
+  assert.equal(detectSite("https://www.netflix.com/browse"), "netflix");
+  assert.equal(detectSite("https://open.spotify.com/"), "spotify");
+  assert.equal(detectSite("https://stackoverflow.com/questions"), "stackoverflow");
+  assert.equal(detectSite("https://www.facebook.com/"), "facebook");
+  assert.equal(detectSite("https://www.instagram.com/"), "instagram");
+});
+
+test("isBrowserApp: bundle prefix or app name", () => {
+  assert.equal(isBrowserApp({ app: "Google Chrome", bundle: "com.google.Chrome" }), true);
+  assert.equal(isBrowserApp({ app: "Whatever", bundle: "com.google.Chrome.canary" }), true);
+  assert.equal(isBrowserApp({ app: "Safari", bundle: "" }), true);
+  assert.equal(isBrowserApp({ app: "Arc" }), true);
+  assert.equal(isBrowserApp({ app: "Brave Browser", bundle: "com.brave.Browser" }), true);
+  assert.equal(isBrowserApp({ app: "Finder", bundle: "com.apple.finder" }), false);
+  assert.equal(isBrowserApp({}), false);
+  assert.equal(isBrowserApp(), false);
+});
+
+test("compactElements preferWeb: web elements survive the cap, output stays in visual order, no web field", () => {
+  const els = [
+    ...Array.from({ length: 6 }, (_, i) => raw(i + 1, { text: `Toolbar ${i}`, href: "", top: i * 10, inViewport: true, web: false })),
+    ...Array.from({ length: 4 }, (_, i) => raw(i + 11, { text: `Page ${i}`, href: `x.com/${i}`, top: 100 + i * 10, inViewport: true, web: true })),
+  ];
+  const plain = compactElements(els, { maxElements: 5 });
+  assert.ok(plain.every((e) => e.text.startsWith("Toolbar") || e.text.startsWith("Page")));
+  assert.equal(plain.filter((e) => e.text.startsWith("Page")).length, 0, "without preferWeb the top of the window wins");
+  const out = compactElements(els, { maxElements: 5, preferWeb: true });
+  assert.equal(out.length, 5);
+  assert.equal(out.filter((e) => e.text.startsWith("Page")).length, 4);
+  const tops = out.map((e) => els.find((r) => r.id === e.id).top);
+  assert.deepEqual(tops, [...tops].sort((a, b) => a - b), "visual order");
+  assert.ok(out.every((e) => !("web" in e)));
+});

@@ -119,7 +119,7 @@ The tab opens as soon as "open a new tab" is complete; the remaining words becom
 
 Open `src/constants.js` on screen.
 
-- `MODEL = "jev-1.13.0"` — pinned, because aliases move and thresholds are tuned per version.
+- `MODEL = "jev-latest"` — follows the newest Jev release; thresholds were tuned on jev-1.13.0.
 - Scroll through `INTENT_CRITERIA`: every option is `{what, not_for, examples}` — contrastive
   descriptions are what make a Choice sharp.
 - `T` — the thresholds you just saw in the gate table. *"This is the entire policy. Change a
@@ -153,6 +153,13 @@ the model only answers the questions a person could answer in a second."*
 - "type hello world into the search box" · "press enter"
 - "scroll down a page" · "scroll up" · "back to the top" (may map to scroll_up or go_back — watch the bars)
 - "reload" · "go forward" · "next tab"
+
+## In Italian (same session, nothing to switch)
+
+- "vai su wikipedia" · "cerca alan turing" · "scorri giù" · "indietro" · "apri una nuova scheda" · "chiudi la scheda" · "premi tab"
+- Desktop mode: "apri la calcolatrice" · "fai 7 più 6" · "copia" · "alza il volume" · "esci da safari" -> "conferma"
+- Mixed is fine: "go to youtube" then "cerca macchine".
+- `node scripts/demo.js --headless` replays the English and the Italian steps.
 
 ## If something goes wrong on camera
 

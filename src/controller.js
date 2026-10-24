@@ -3,30 +3,63 @@
  * policy -> Playwright action -> fresh snapshot. Emits events for the UI / demo / tests.
  */
 import { EventEmitter } from "node:events";
-import { DEBOUNCE_MS, SILENCE_COMPLETE_MS, CANDIDATE_TTL_MS, MAX_INFLIGHT, MAX_CONTEXT_ACTIONS, MODEL, T } from "./constants.js";
+import {
+  DEBOUNCE_MS,
+  CANDIDATE_TTL_MS,
+  MAX_INFLIGHT,
+  MAX_CONTEXT_ACTIONS,
+  MODEL,
+  T,
+  DEFAULT_LOCALE,
+  ANSWER_CACHE_TTL_MS,
+  ANSWER_CACHE_MAX,
+  PENDING_TTL_MS,
+  UNCLEAR_TOAST_MS,
+  UI_TEXT,
+  VERB_ONLY_WORDS,
+} from "./constants.js";
+import { uiLang } from "./locale.js";
 import { decide, isAbortError } from "./jev.js";
 import { evaluatePolicy, describe } from "./policy.js";
 import { execute } from "./executor.js";
-import { parseCandidatePick, cleanTranscript } from "./spans.js";
+import { parseCandidatePick, parseConfirmation, cleanTranscript } from "./spans.js";
 import { approxTokens } from "./snapshot.js";
 
 const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
+/** Small string hash (FNV-1a) for the answer-cache key: what is ON screen, not only which element ids exist. */
+function hashStrings(parts) {
+  let h = 0x811c9dc5;
+  for (const p of parts) {
+    for (let i = 0; i < p.length; i++) h = Math.imul(h ^ p.charCodeAt(i), 0x01000193);
+    h = Math.imul(h ^ 0x1f, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
 export class Controller extends EventEmitter {
   /**
-   * @param {{browser: import('./browser.js').BrowserManager, decideFn?: Function, executeFn?: Function}} opts
+   * @param {{browser: import('./browser.js').BrowserManager, decideFn?: Function, executeFn?: Function, lang?: string}} opts
    *   decideFn / executeFn are injectable for tests (default: real Jev + Playwright).
+   *   lang is the recognizer locale; commands are always bilingual, the locale picks the toast language.
    */
-  constructor({ browser, decideFn = decide, executeFn = execute }) {
+  constructor({ browser, decideFn = decide, executeFn = execute, lang = DEFAULT_LOCALE }) {
     super();
     this.browser = browser;
+    this.lang = lang;
+    this.uiLang = uiLang(lang);
+    this.browser.uiLang = this.uiLang; // executors localize their toasts from it
+    this.answerCache = new Map(); // key -> {result, at}; insertion order = LRU order
     this._decide = decideFn;
     this._execute = executeFn;
     this.snapshot = null;
     this.snapshotAt = 0;
     this.utterance = null; // { id, physicalId, prefix, gen, text, final, startedAt, updatedAt, actedOn, actedText }
     this.consumed = null; // { id: physical utterance id, prefix: executed text (lowercase), gen }
-    this.pending = null; // destructive action awaiting "confirm"
+    this.pending = null; // destructive action awaiting "confirm" (expires after PENDING_TTL_MS, see _pendingNow)
+    this.pendingAt = 0;
+    this.actionSeq = 0; // executed actions so far (answer-cache key: a cap on recentActions would stop it changing)
+    this._warming = null; // in-flight opportunistic snapshot refresh (see _warmSnapshot)
     this.candidates = null; // { list: [{n,id,label}], intent: {type,text}, at }
     this.lastDecision = null;
     this.debounceTimer = null;
@@ -34,7 +67,7 @@ export class Controller extends EventEmitter {
     this.inflight = []; // [{ac, text, at}] requests currently awaiting Jev
     this.busy = false;
     this.log = [];
-    this.stats = { calls: 0, inputTokens: 0, costUsd: 0, latencies: [], actions: 0, model: MODEL, commandToActionMs: [], decisionMs: [] };
+    this.stats = { calls: 0, inputTokens: 0, costUsd: 0, latencies: [], actions: 0, model: MODEL, commandToActionMs: [], decisionMs: [], cacheHits: 0, dedupedRequests: 0, unclear: 0 };
     this.history = [];
     // Conversation context sent to Jev with every request (see jev.encodeContext):
     // the page before the last navigation and the last few executed actions.
@@ -45,6 +78,11 @@ export class Controller extends EventEmitter {
   async start() {
     await this.refreshSnapshot();
     this._log("info", `ready — model ${MODEL}, ${this.snapshot.elements.length} elements on ${this.snapshot.url}`);
+  }
+
+  /** Toast text in the UI language. */
+  _t() {
+    return UI_TEXT[this.uiLang] || UI_TEXT.en;
   }
 
   _log(level, msg, extra = {}) {
@@ -59,6 +97,37 @@ export class Controller extends EventEmitter {
     this.snapshotAt = Date.now();
     this.emit("snapshot", this.snapshot);
     return this.snapshot;
+  }
+
+  /**
+   * Start a snapshot refresh without waiting for it: called on the first words of a new utterance so the (slow, in desktop
+   * mode) accessibility walk overlaps the debounce and the speech itself instead of sitting in front of the Jev request.
+   */
+  _warmSnapshot() {
+    if (this._warming || this.busy || Date.now() - this.snapshotAt <= 1500) return;
+    this._warming = this.refreshSnapshot()
+      .catch(() => {})
+      .finally(() => {
+        this._warming = null;
+      });
+  }
+
+  /** The pending confirmation, or null once it has expired: a stray "ok" a minute later must never quit an app. */
+  _pendingNow() {
+    if (this.pending && Date.now() - this.pendingAt > PENDING_TTL_MS) this._clearPending("expired");
+    return this.pending;
+  }
+
+  _setPending(action) {
+    this.pending = action;
+    this.pendingAt = Date.now();
+  }
+
+  _clearPending(why = "") {
+    if (!this.pending) return;
+    this.pending = null;
+    if (why) this._log("debug", `pending confirmation dropped (${why})`);
+    this.emit("pending", null);
   }
 
   /** Typed command fallback: behaves like a final utterance. */
@@ -87,7 +156,9 @@ export class Controller extends EventEmitter {
       virtualId = `${utteranceId}+${consumed.gen}`;
     }
 
+    let newUtterance = false;
     if (!this.utterance || this.utterance.id !== virtualId) {
+      newUtterance = true;
       this.utterance = {
         id: virtualId,
         physicalId: utteranceId,
@@ -109,6 +180,25 @@ export class Controller extends EventEmitter {
     }
     this.emit("transcript", { text: clean, final, utteranceId: virtualId, actedOn: this.utterance.actedOn });
     if (!clean || this.utterance.actedOn) return;
+    if (newUtterance) this._warmSnapshot(); // first words of a new utterance
+
+    // Deterministic shortcut: while a confirmation is open, a bare "conferma" / "annulla" needs no Jev. Only unambiguous
+    // words count here ("ok", "sure" are what people say to each other; those go through Jev, which sees the pending prompt).
+    // Runs before the lone-verb rule below: a partial "vai" is a complete confirmation.
+    if (this._pendingNow()) {
+      const verdict = parseConfirmation(clean, { casual: false });
+      if (verdict) {
+        clearTimeout(this.debounceTimer);
+        clearTimeout(this.silenceTimer);
+        this._consume(this.utterance, clean);
+        const pending = this.pending;
+        this._clearPending();
+        this._log("info", `${verdict} by voice — no model call`);
+        if (verdict === "confirm") this._runAction({ ...pending, confirmed: true }, { via: "confirm-fast-path" });
+        else this.browser.overlay("toast", this._t().cancelled);
+        return;
+      }
+    }
 
     // Deterministic shortcut: numbered candidate overlays + a spoken number => no Jev needed.
     if (this.candidates && now - this.candidates.at < CANDIDATE_TTL_MS) {
@@ -119,9 +209,18 @@ export class Controller extends EventEmitter {
         this._log("info", `picked candidate ${n} (${c.label}) by number — no model call`);
         const action = { ...this.candidates.intent, targetId: c.id, label: c.label };
         this.candidates = null;
+        this._clearPending("another command ran");
         this._runAction(action, { via: "candidate-pick" });
         return;
       }
+    }
+
+    // A lone verb ("chiudi", "apri", "close") is the start of a command, never a command: wait for
+    // the object (or the final result) instead of spending a Jev call that could act on a guess.
+    if (!final && VERB_ONLY_WORDS.has(clean.toLowerCase().replace(/[.,;:!?]+$/, ""))) {
+      clearTimeout(this.debounceTimer);
+      clearTimeout(this.silenceTimer);
+      return;
     }
 
     clearTimeout(this.debounceTimer);
@@ -157,43 +256,64 @@ export class Controller extends EventEmitter {
       old.ac.abort();
     }
     const ac = new AbortController();
-    const req = { ac, text: utt.text, at: Date.now() };
+    const req = { ac, text: utt.text, at: Date.now(), key: null };
     this.inflight.push(req);
 
-    if (Date.now() - this.snapshotAt > 1500) await this.refreshSnapshot();
+    // The refresh normally started with the first words (see _warmSnapshot) and is nearly done by now.
+    if (this._warming) await this._warming;
+    else if (Date.now() - this.snapshotAt > 1500) await this.refreshSnapshot();
 
     const textAtRequest = utt.text;
-    let result;
-    try {
-      result = await this._decide(
-        {
-          transcript: textAtRequest,
-          snapshot: this.snapshot,
-          pendingConfirmation: this.pending ? describe(this.pending) : null,
-          tabs: this.browser.tabInfo(),
-          context: this.context,
-        },
-        { signal: ac.signal },
-      );
-    } catch (err) {
+    const cacheKey = this._cacheKey(textAtRequest);
+    let result = this._cacheGet(cacheKey);
+    let cached = Boolean(result);
+    // The recognizer's final arrives ~650 ms after the last partial: if the request for those very words is still in flight,
+    // do not send a second identical one. That request reads the utterance's state (final / silence) when it comes back.
+    if (!cached && this.inflight.some((r) => r !== req && r.key === cacheKey && !r.ac.signal.aborted)) {
       this.inflight = this.inflight.filter((r) => r !== req);
-      if (isAbortError(err) || ac.signal.aborted) {
-        this._log("debug", `cancelled stale request for "${textAtRequest}"`);
-        return;
-      }
-      this._log("error", `Jev error: ${err.message || err}`);
-      this.emit("error", err);
+      this.stats.dedupedRequests += 1;
       return;
     }
-    this.inflight = this.inflight.filter((r) => r !== req);
-    if (ac.signal.aborted || this.utterance !== utt || utt.actedOn) return;
+    req.key = cacheKey;
+    if (cached) {
+      // Same words, same screen: Jev would answer the same. Re-run only the pure policy below
+      // (silence has grown since the last look).
+      this.inflight = this.inflight.filter((r) => r !== req);
+      this.stats.cacheHits += 1;
+    } else {
+      try {
+        result = await this._decide(
+          {
+            transcript: textAtRequest,
+            snapshot: this.snapshot,
+            pendingConfirmation: this._pendingNow() ? describe(this.pending, "en") : null,
+            tabs: this.browser.tabInfo(),
+            context: this.context,
+          },
+          { signal: ac.signal },
+        );
+      } catch (err) {
+        this.inflight = this.inflight.filter((r) => r !== req);
+        if (isAbortError(err) || ac.signal.aborted) {
+          this._log("debug", `cancelled stale request for "${textAtRequest}"`);
+          return;
+        }
+        this._log("error", `Jev error: ${err.message || err}`);
+        this.emit("error", err);
+        return;
+      }
+      this.inflight = this.inflight.filter((r) => r !== req);
+      if (ac.signal.aborted || this.utterance !== utt || utt.actedOn) return;
+      this._cachePut(cacheKey, result);
 
-    this.stats.calls += 1;
-    this.stats.inputTokens += result.usage?.input_tokens ?? 0;
-    this.stats.costUsd += result.costUsd;
-    this.stats.latencies.push(result.latencyMs);
-    if (this.stats.latencies.length > 200) this.stats.latencies.shift();
-    if (result.model && result.model !== this.stats.model) this.stats.model = result.model;
+      this.stats.calls += 1;
+      this.stats.inputTokens += result.usage?.input_tokens ?? 0;
+      this.stats.costUsd += result.costUsd;
+      this.stats.latencies.push(result.latencyMs);
+      if (this.stats.latencies.length > 200) this.stats.latencies.shift();
+      if (result.model && result.model !== this.stats.model) this.stats.model = result.model;
+    }
+    if (this.utterance !== utt || utt.actedOn) return;
 
     // If more words arrived while this request was in flight, its transcript is a prefix of the
     // real one: it may still act on closed-set intents (the words already commit to "go back"),
@@ -206,8 +326,9 @@ export class Controller extends EventEmitter {
       snapshot: this.snapshot,
       silentMs,
       isFinal: utt.final && !stale,
-      pending: this.pending,
+      pending: this._pendingNow(),
       context: this.context,
+      lang: this.uiLang,
     });
 
     const decision = {
@@ -225,6 +346,7 @@ export class Controller extends EventEmitter {
       stateTokens: approxTokens(result.state),
       policy,
       silentMs,
+      cached,
       thresholds: T,
       at: Date.now(),
     };
@@ -232,52 +354,101 @@ export class Controller extends EventEmitter {
     this.emit("decision", decision);
     this._log(
       policy.decision === "act" ? "act" : "info",
-      `${result.latencyMs}ms · "${textAtRequest}" → ${policy.decision}: ${policy.summary}`,
+      `${cached ? "cache" : `${result.latencyMs}ms`} · "${textAtRequest}" → ${policy.decision}: ${policy.summary}`,
     );
 
     switch (policy.decision) {
       case "act":
         this._consume(utt, textAtRequest);
-        if (policy.action.confirmed) this.pending = null;
+        // Any executed command closes an open confirmation: the user moved on, a later "ok" is not an answer to it.
+        this._clearPending(policy.action.confirmed ? "" : "another command ran");
         this.candidates = null;
         await this._runAction(policy.action, { decision, utterance: utt });
         break;
       case "confirm":
         this._consume(utt, textAtRequest);
-        this.pending = policy.action;
-        await this.browser.overlay("toast", `Say "confirm" to ${describe(policy.action)}`, 6000);
+        this._setPending(policy.action);
+        await this.browser.overlay("toast", this._t().confirm.replace("{action}", describe(policy.action, this.uiLang)), 6000);
         this.emit("pending", { action: policy.action, summary: policy.summary });
         break;
       case "cancel":
         this._consume(utt, textAtRequest);
-        this.pending = null;
-        await this.browser.overlay("toast", "cancelled");
-        this.emit("pending", null);
+        this._clearPending();
+        await this.browser.overlay("toast", this._t().cancelled);
         break;
       case "disambiguate": {
+        this._clearPending("another command ran");
         const list = policy.candidates.map((c, i) => ({ n: i + 1, id: c.id, label: c.label, p: c.p }));
         this.candidates = { list, intent: policy.pendingIntent, at: Date.now() };
         await this.browser.overlay("candidates", list, CANDIDATE_TTL_MS);
-        await this.browser.overlay("toast", "Which one? Say the number.", 3000);
+        await this.browser.overlay("toast", this._t().which, 3000);
         this.emit("candidates", list);
-        this._scheduleSilenceRetry(utt);
         break;
       }
       case "wait":
-        this._scheduleSilenceRetry(utt, policy.retryInMs);
+        // Poll again only for waits a passing clock can flip; every other wait needs new words.
+        if (typeof policy.retryInMs === "number") this._scheduleSilenceRetry(utt, policy.retryInMs);
+        else if (utt.final && !stale && !utt.unclearShown) await this._toastUnclear(utt, policy);
         break;
       default:
         break;
     }
   }
 
-  /** If the user stops talking, re-evaluate with silentMs so `complete` is bypassed. */
-  _scheduleSilenceRetry(utt, retryInMs = null) {
+  /** Re-evaluate after `retryInMs` (the policy's own clock gate) so silence can unlock the command. */
+  _scheduleSilenceRetry(utt, retryInMs) {
     clearTimeout(this.silenceTimer);
-    const waitFor = retryInMs ?? Math.max(50, SILENCE_COMPLETE_MS - (Date.now() - utt.updatedAt));
     this.silenceTimer = setTimeout(() => {
       if (this.utterance === utt && !utt.actedOn) this.decideNow("silence");
-    }, waitFor);
+    }, Math.max(50, retryInMs));
+  }
+
+  /** A finished utterance that still means nothing: say so once instead of looping. */
+  async _toastUnclear(utt, policy) {
+    utt.unclearShown = true;
+    this.stats.unclear += 1;
+    const text = policy.dangling ? this._t().incomplete : this._t().unclear;
+    this.emit("unclear", { text, transcript: utt.text, dangling: Boolean(policy.dangling) });
+    await this.browser.overlay("toast", text, UNCLEAR_TOAST_MS);
+  }
+
+  /** What Jev is shown, reduced to what could change its answer. */
+  _cacheKey(transcript) {
+    const s = this.snapshot;
+    // The element TEXTS are part of the key: a page that re-renders in place keeps its ids, url and title.
+    const sig = s ? `${s.url}|${s.title}|${hashStrings((s.elements || []).map((e) => `${e.id}|${e.role}|${e.text ?? ""}`))}` : "";
+    return [transcript, sig, this.pending ? describe(this.pending, "en") : "", this.actionSeq].join("\u0001");
+  }
+
+  _cacheGet(key) {
+    const hit = this.answerCache.get(key);
+    if (!hit) return null;
+    this.answerCache.delete(key);
+    if (Date.now() - hit.at > ANSWER_CACHE_TTL_MS) return null;
+    this.answerCache.set(key, hit); // most recently used goes last
+    return hit.result;
+  }
+
+  _cachePut(key, result) {
+    this.answerCache.delete(key);
+    this.answerCache.set(key, { result, at: Date.now() });
+    while (this.answerCache.size > ANSWER_CACHE_MAX) this.answerCache.delete(this.answerCache.keys().next().value);
+  }
+
+  /** `set_language` never reaches an executor: it retargets the recognizer and the toasts. */
+  async _setLanguage(action) {
+    try {
+      await this.browser.setLang?.(action.locale);
+    } catch (err) {
+      return { ok: false, detail: String(err.message || err) };
+    }
+    this.lang = action.locale;
+    this.uiLang = uiLang(action.locale);
+    this.browser.uiLang = this.uiLang;
+    this.answerCache.clear();
+    this.emit("lang", { lang: this.lang, uiLang: this.uiLang });
+    await this.browser.overlay("toast", describe(action, this.uiLang));
+    return { ok: true, detail: action.locale };
   }
 
   async _runAction(action, meta = {}) {
@@ -286,7 +457,7 @@ export class Controller extends EventEmitter {
     const utt = meta.utterance || this.utterance;
     const pageBefore = this.snapshot ? { url: this.snapshot.url, title: this.snapshot.title, site: this.snapshot.site } : null;
     try {
-      const res = await this._execute(action, this.browser);
+      const res = action.type === "set_language" ? await this._setLanguage(action) : await this._execute(action, this.browser);
       const took = Date.now() - t0;
       const sinceLastWord = utt ? Date.now() - utt.updatedAt : null;
       const sinceUtteranceStart = utt ? Date.now() - utt.startedAt : null;
@@ -306,10 +477,11 @@ export class Controller extends EventEmitter {
         sinceUtteranceStartMs: sinceUtteranceStart,
         via: meta.via || "jev",
       };
-      this._log(res.ok ? "act" : "warn", `${res.ok ? "✓" : "✗"} ${describe(action)} — decided ${decisionMs ?? "?"}ms after last word, executed in ${took}ms ${res.detail || ""}`);
+      const decided = decisionMs == null ? "" : `decided ${decisionMs}ms after last word, `;
+      this._log(res.ok ? "act" : "warn", `${res.ok ? "✓" : "✗"} ${describe(action, this.uiLang)} — ${decided}executed in ${took}ms ${res.detail || ""}`);
       this.emit("action", entry);
     } catch (err) {
-      this._log("error", `action failed: ${describe(action)} — ${err.message || err}`);
+      this._log("error", `action failed: ${describe(action, this.uiLang)} — ${err.message || err}`);
       this.emit("action", { action, ok: false, detail: String(err.message || err) });
     } finally {
       this.busy = false;
@@ -329,6 +501,7 @@ export class Controller extends EventEmitter {
     let outcome = ok ? "done" : "failed";
     if (ok && navigated) outcome = `navigated to ${after.replace(/^https?:\/\/(www\.)?/, "").slice(0, 80)}`;
     else if (ok && typeof detail === "string" && detail && !detail.startsWith("http")) outcome = detail.slice(0, 80);
+    this.actionSeq += 1;
     this.context.recentActions.push({
       type: action.type,
       targetId: action.targetId ?? null,
@@ -354,6 +527,7 @@ export class Controller extends EventEmitter {
     const p50 = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
     return {
       model: this.stats.model,
+      lang: this.lang,
       thresholds: T,
       stats: {
         calls: this.stats.calls,
@@ -365,6 +539,9 @@ export class Controller extends EventEmitter {
         avgLatencyMs: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
         avgCommandToActionMs: avg(this.stats.commandToActionMs),
         avgDecisionMs: avg(this.stats.decisionMs),
+        cacheHits: this.stats.cacheHits,
+        dedupedRequests: this.stats.dedupedRequests,
+        unclear: this.stats.unclear,
       },
       snapshot: this.snapshot && {
         url: this.snapshot.url,
@@ -376,7 +553,7 @@ export class Controller extends EventEmitter {
       },
       lastDecision: this.lastDecision,
       context: this.context,
-      pending: this.pending ? { summary: describe(this.pending) } : null,
+      pending: this._pendingNow() ? { summary: describe(this.pending, this.uiLang) } : null,
       candidates: this.candidates?.list ?? null,
       log: this.log.slice(-60),
     };

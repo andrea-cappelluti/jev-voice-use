@@ -173,14 +173,16 @@
     ws.onmessage = (ev) => {
       const { type, payload } = JSON.parse(ev.data);
       switch (type) {
-        case "hello": ui = payload; renderAll(); break;
+        case "hello": ui = payload; setRecLang(payload.lang); renderAll(); break;
+        case "lang": setRecLang(payload.lang); break;
+        case "unclear": appendLog({ t: Date.now(), level: "warn", msg: `not understood: "${payload.transcript}"` }); break;
         case "transcript": renderTranscript(payload); break;
         case "decision": renderDecision(payload); break;
         case "action": ui = payload.ui; renderStats(); renderSnapshot(); break;
         case "snapshot": ui && (ui.snapshot = payload); renderSnapshot(); break;
         case "log": appendLog(payload); break;
         case "candidates": candIds = new Set((payload || []).map((c) => c.id)); renderSnapshot(); break;
-        case "pending": $("pending").textContent = payload ? `⚠ pending: ${payload.summary} — say "confirm" or "cancel"` : ""; break;
+        case "pending": $("pending").textContent = payload ? `⚠ pending: ${payload.summary} — say "confirm" (conferma) or "cancel" (annulla)` : ""; break;
         case "tabs": $("tabs").textContent = `${payload.length} tab${payload.length === 1 ? "" : "s"}`; break;
       }
     };
@@ -194,7 +196,7 @@
     $("log").innerHTML = "";
     (ui.log || []).forEach(appendLog);
     if (ui.lastDecision) renderDecision(ui.lastDecision);
-    if (ui.pending) $("pending").textContent = `⚠ pending: ${ui.pending.summary} — say "confirm" or "cancel"`;
+    if (ui.pending) $("pending").textContent = `⚠ pending: ${ui.pending.summary} — say "confirm" (conferma) or "cancel" (annulla)`;
   }
   function renderStats() {
     const s = ui.stats;
@@ -291,10 +293,13 @@
   // ------------------------------------------------------------ speech
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   let rec = null, micOn = false, utteranceBase = 0;
+  // Recognizer language comes from the server (--lang / $VB_LANG / system locale); commands are bilingual anyway.
+  let recLang = (navigator.language || "en-US");
+  function setRecLang(l) { if (l) { recLang = l; if (rec) rec.lang = l; } }
   function startMic() {
     if (!SR) { alert("Web Speech API not available. Use Chrome or Edge, or type commands below."); return; }
     rec = new SR();
-    rec.continuous = true; rec.interimResults = true; rec.lang = "en-US"; rec.maxAlternatives = 1;
+    rec.continuous = true; rec.interimResults = true; rec.lang = recLang; rec.maxAlternatives = 1;
     rec.onresult = (ev) => {
       // Results before ev.resultIndex are finished. Each result index is a distinct utterance.
       for (let i = ev.resultIndex; i < ev.results.length; i++) {

@@ -21,6 +21,9 @@ export class BrowserManager {
     this.listeners = new Set();
   }
 
+  /** The recognizer lives in the control page; there is nothing to switch on this side. */
+  async setLang() {}
+
   onChange(fn) {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
